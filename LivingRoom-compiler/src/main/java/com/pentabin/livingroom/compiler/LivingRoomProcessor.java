@@ -6,8 +6,13 @@ import androidx.room.TypeConverters;
 
 import com.pentabin.livingroom.annotations.Archivable;
 import com.pentabin.livingroom.annotations.Crudable;
+import com.pentabin.livingroom.annotations.DatabaseMeta;
+import com.pentabin.livingroom.annotations.DatabaseOnCreate;
+import com.pentabin.livingroom.annotations.DatabaseOnDestructiveMigration;
+import com.pentabin.livingroom.annotations.DatabaseOnOpen;
 import com.pentabin.livingroom.annotations.Deletable;
 import com.pentabin.livingroom.annotations.Insertable;
+import com.pentabin.livingroom.annotations.ManualMigrationMethod;
 import com.pentabin.livingroom.annotations.SelectableAll;
 import com.pentabin.livingroom.annotations.SelectableById;
 import com.pentabin.livingroom.annotations.SelectableWhere;
@@ -20,8 +25,14 @@ import com.squareup.javapoet.JavaFile;
 import com.squareup.javapoet.MethodSpec;
 import com.squareup.javapoet.TypeName;
 import com.squareup.javapoet.TypeSpec;
+import com.sun.source.tree.MethodTree;
+import com.sun.source.util.TreePath;
+import com.sun.source.util.TreePathScanner;
+import com.sun.source.util.Trees;
 
 import java.io.IOException;
+import java.lang.annotation.Annotation;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -37,7 +48,10 @@ import javax.annotation.processing.RoundEnvironment;
 import javax.annotation.processing.SupportedAnnotationTypes;
 import javax.annotation.processing.SupportedSourceVersion;
 import javax.lang.model.SourceVersion;
+import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
@@ -62,6 +76,7 @@ import static com.pentabin.livingroom.compiler.LivingroomMethod.selectWhereMetho
                 "com.pentabin.livingroom.annotations.SelectableById",
                 "com.pentabin.livingroom.annotations.SelectableWhere",
                 "com.pentabin.livingroom.annotations.SelectableWheres",
+                "com.pentabin.livingroom.annotations.DatabaseExtras",
         })
 @SupportedSourceVersion(SourceVersion.RELEASE_8)
 public class LivingRoomProcessor extends AbstractProcessor {
@@ -93,6 +108,8 @@ public class LivingRoomProcessor extends AbstractProcessor {
         parseSelectables(env);
         parseSelectableAll(env);
         parseSelectableById(env);
+        parseDatabaseExtras(env);
+        parseDatabaseManualMigrations(env);
 
         try {
             generateClasses();
@@ -120,8 +137,8 @@ public class LivingRoomProcessor extends AbstractProcessor {
 
     private void generateClasses() throws IOException {
         for (Map.Entry<TypeElement, EntityClass> e: entitiesList.entrySet()) {
-                generateCodeForEntity(e.getValue());
-                entities.add(e.getValue().getTypeName());
+            generateCodeForEntity(e.getValue());
+            entities.add(e.getValue().getTypeName());
         }
 
         try {
@@ -182,6 +199,127 @@ public class LivingRoomProcessor extends AbstractProcessor {
         Collection<? extends Element> archivableElements =
                 env.getElementsAnnotatedWith(SelectableById.class);
         parseAnnotation(archivableElements, GET_BY_ID);
+    }
+
+    private String versionValue = "1";
+    private String exportSchemaValue = "true";
+    private String autoMigrationRawCode = "{}";
+    private String databaseCallbackQualifiedClassName;
+    private String onOpenMethodName = "";
+    private String onCreateMethodName = "";
+    private String onDestructiveMigrationMethodName = "";
+
+    private void parseDatabaseCallbackClass(String databaseCallbackSimpleClassName, RoundEnvironment env) {
+
+        Collection<? extends Element> onOpenElement =
+                env.getElementsAnnotatedWith(DatabaseOnOpen.class);
+
+        for(Element element : onOpenElement) {
+            //Ensuring this method is defined inside the Database Callback class specified in the Database Meta annotated class
+            if(element.getEnclosingElement().getSimpleName().contentEquals(databaseCallbackSimpleClassName)) {
+                onOpenMethodName = databaseCallbackQualifiedClassName+"."+element.getSimpleName().toString()+"(db);";
+                break; //allowing only one method to exist
+            }
+        }
+
+        Collection<? extends Element> onCreateElement =
+                env.getElementsAnnotatedWith(DatabaseOnCreate.class);
+
+        for(Element element : onCreateElement) {
+            //Ensuring this method is defined inside the Database Callback class specified in the Database Meta annotated class
+            if(element.getEnclosingElement().getSimpleName().contentEquals(databaseCallbackSimpleClassName)) {
+                onCreateMethodName = databaseCallbackQualifiedClassName+"."+element.getSimpleName().toString()+"(db);";
+                break; //allowing only one method to exist
+            }
+        }
+
+        Collection<? extends Element> onDestructiveMigrationElement =
+                env.getElementsAnnotatedWith(DatabaseOnDestructiveMigration.class);
+
+        for(Element element : onDestructiveMigrationElement) {
+            //Ensuring this method is defined inside the Database Callback class specified in the Database Meta annotated class
+            if(element.getEnclosingElement().getSimpleName().contentEquals(databaseCallbackSimpleClassName)) {
+                onDestructiveMigrationMethodName = databaseCallbackQualifiedClassName+"."+element.getSimpleName().toString()+"(db);";
+                break; //allowing only one method to exist
+            }
+        }
+
+    }
+
+    private ArrayList<String> manualMigrations = new ArrayList<>();
+
+    private void parseDatabaseManualMigrations(RoundEnvironment env) {
+        Collection<? extends Element> manualMigrationMethodElements =
+                env.getElementsAnnotatedWith(ManualMigrationMethod.class);
+        for(Element manualMigrationMethodElement : manualMigrationMethodElements) {
+
+            Element enclosingElement = manualMigrationMethodElement.getEnclosingElement();
+
+            String migrationMethodToBecalled = enclosingElement.toString()+"."+manualMigrationMethodElement.getSimpleName();
+            //processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, );
+
+
+            for (AnnotationMirror annotationElement : enclosingElement.getAnnotationMirrors()) {
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,annotationElement.getElementValues().toString());
+                String from = null;
+                String to = null;
+                for(ExecutableElement key : annotationElement.getElementValues().keySet()) {
+                    if(key.getSimpleName().contentEquals("from")) {
+                        from = annotationElement.getElementValues().get(key).toString();
+                        //processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, annotationElement.getElementValues().get(key).toString());
+                    } else if(key.getSimpleName().contentEquals("to")) {
+                        to = annotationElement.getElementValues().get(key).toString();
+                        //processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, annotationElement.getElementValues().get(key).toString());
+                    }
+                }
+                annotationElement.getElementValues().get("from");
+                manualMigrations.add("new androidx.room.migration.Migration("+from+", "+to+") {\n" +
+                        "               @Override\n" +
+                        "               public void migrate(androidx.sqlite.db.SupportSQLiteDatabase database) {\n" +
+                        "                   "+migrationMethodToBecalled+"(database);\n"+
+                        "               }}");
+            }
+        }
+    }
+
+    private void parseDatabaseExtras(RoundEnvironment env) {
+
+        Collection<? extends Element> databaseExtraElements =
+                env.getElementsAnnotatedWith(DatabaseMeta.class);
+
+        if(databaseExtraElements.size()>1) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, "This version of Rooms boilerplate code generator supports only one 'Database Meta' corresponding to one 'Database' for the App!");
+        } else if(databaseExtraElements.size()!=0) {
+
+            //We have atleast one class defining the database extras
+            for(Element extras : databaseExtraElements) {
+                //Processing class annotated with DatabaseMeta
+                for(AnnotationMirror annotationElement : extras.getAnnotationMirrors()) {
+                    //Processing all annotation values
+                    for(ExecutableElement  annotationValues : annotationElement.getElementValues().keySet()){
+                        if(annotationValues.getSimpleName().contentEquals("version")) {
+                            //Saving passed version number
+                            versionValue = annotationElement.getElementValues().get(annotationValues).getValue().toString();
+                        } else if(annotationValues.getSimpleName().contentEquals("exportSchema")) {
+                            //saving passed exportSchema boolean
+                            exportSchemaValue = annotationElement.getElementValues().get(annotationValues).getValue().toString();
+                        } else if(annotationValues.getSimpleName().contentEquals("autoMigrations")) {
+                            //saving autoMigrations details
+                            String autoMigrationsValue = annotationElement.getElementValues().get(annotationValues).getValue().toString();
+                            autoMigrationRawCode = "{\n" +
+                                    "    " + autoMigrationsValue.toString() + ", " +
+                                    "  }";
+                            //processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, autoMigrationRawCode);
+                        } else if(annotationValues.getSimpleName().contentEquals("databaseCallbacks")) {
+                            //processing if database callbacks are defined
+                            databaseCallbackQualifiedClassName = annotationElement.getElementValues().get(annotationValues).getValue().toString();
+                            String databaseCallbackSimpleClassName = databaseCallbackQualifiedClassName.substring(databaseCallbackQualifiedClassName.lastIndexOf('.') + 1);
+                            parseDatabaseCallbackClass(databaseCallbackSimpleClassName, env);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private void parseSelectable(RoundEnvironment env) { // TODO refactor
@@ -298,7 +436,7 @@ public class LivingRoomProcessor extends AbstractProcessor {
             listEntities.append(entityClassName).append(".class, ");
             listDaoMethods.add(
                     MethodSpec.methodBuilder(
-                            (entityClassName+ SUFFIX_DAO).toLowerCase())
+                                    (entityClassName+ SUFFIX_DAO).toLowerCase())
                             .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
                             .returns(ClassName.get(packageName, entityClassName+ SUFFIX_DAO))
                             .build());
@@ -311,20 +449,42 @@ public class LivingRoomProcessor extends AbstractProcessor {
         MethodSpec getDatabase = MethodSpec.methodBuilder("getDatabase")
                 .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
                 .addParameter(ClassName.get("android.content",
-                        "Context"),
+                                "Context"),
                         "context",
                         Modifier.FINAL)
                 .addCode("if ($N == null) {\n" +
-                        "    synchronized ($T.class) {\n" +
-                        "        if ($N == null) {\n" +
-                        "            $N = androidx.room.Room.databaseBuilder(context.getApplicationContext(),\n" +
-                        "                    $T.class, \""+dataBaseName+"\")\n" +
-                        "                    .fallbackToDestructiveMigration()\n" +
-                        "                    .build();\n" +
-                        "        }\n" +
-                        "    }\n" +
-                        "}\n" +
-                        "return $N;",
+                                "    synchronized ($T.class) {\n" +
+                                "        if ($N == null) {\n" +
+                                "            $N = androidx.room.Room.databaseBuilder(context.getApplicationContext(),\n" +
+                                "                    $T.class, \""+dataBaseName+"\")\n" +
+                                "                    .fallbackToDestructiveMigration()\n" +
+                                "                    .enableMultiInstanceInvalidation()\n"+
+                                "                    .addCallback(new RoomDatabase.Callback() {\n" +
+                                "                       @Override\n" +
+                                "                       public void onCreate(androidx.sqlite.db.SupportSQLiteDatabase db) {\n" +
+                                "                           super.onCreate(db);\n" +
+                                "                           "+onCreateMethodName+"\n" +
+                                "                           //com.pentabin.livingroom.DatabaseCallbacksKt.onDatabaseCreate(db);\n" +
+                                "                       }\n" +
+                                "\n" +
+                                "                       @Override\n" +
+                                "                       public void onOpen(androidx.sqlite.db.SupportSQLiteDatabase db) {\n" +
+                                "                           super.onOpen(db);\n" +
+                                "                           "+onOpenMethodName+"\n" +
+                                "                       }\n" +
+                                "\n" +
+                                "                       @Override\n" +
+                                "                       public void onDestructiveMigration(androidx.sqlite.db.SupportSQLiteDatabase db) {\n" +
+                                "                           super.onDestructiveMigration(db);\n" +
+                                "                           "+onDestructiveMigrationMethodName+"\n" +
+                                "                       }\n" +
+                                "                       })\n"+
+                                "                   .addMigrations("+String.join(",",manualMigrations)+")\n" +
+                                "                   .build();\n" +
+                                "        }\n" +
+                                "    }\n" +
+                                "}\n" +
+                                "return $N;",
                         instanceName, ClassName.get(packageName, dbClassName) , instanceName, instanceName, ClassName.get(packageName, dbClassName), instanceName)
                 .returns(ClassName.get(packageName, dbClassName))
                 .build();
@@ -334,8 +494,9 @@ public class LivingRoomProcessor extends AbstractProcessor {
                 .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
                 .addAnnotation(AnnotationSpec.builder(Database.class)
                         .addMember("entities", listEntities.toString())
-                        .addMember("version", "1")
-                        .addMember("exportSchema", "false")
+                        .addMember("version", versionValue)
+                        .addMember("exportSchema", exportSchemaValue)
+                        .addMember("autoMigrations", autoMigrationRawCode)
                         .build())
                 .addAnnotation(AnnotationSpec.builder(TypeConverters.class)
                         .addMember("value", "$T.class", ClassName.get("com.pentabin.livingroom", "DateConverter") )
@@ -352,3 +513,4 @@ public class LivingRoomProcessor extends AbstractProcessor {
     }
 
 }
+
