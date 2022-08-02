@@ -35,8 +35,8 @@ And these two lines to your `build.gradle` (app)
 ```
 dependencies {
     ...
-    implementation 'com.github.Jagatheesan:LivingRoom:0.5-original'
-    annotationProcessor 'com.github.Jagatheesan.LivingRoom:LivingRoom-compiler:0.5-original'
+    implementation 'com.github.Jagatheesan:LivingRoom:1.1.1'
+    annotationProcessor 'com.github.Jagatheesan.LivingRoom:LivingRoom-compiler:1.1.1'
     ...
 }
 ```
